@@ -40,7 +40,61 @@ test("registration discovery and configuration validation", function()
   assert(not client.connection({ server = "http://user:secret@localhost" }))
   assert(not pcall(plugin.setup, { timeout_ms = 0 }))
   assert(not pcall(plugin.setup, { unexpected = true }))
+  for _, key in ipairs({ "context_window" }) do
+    for _, invalid in ipairs({ 0, -1, 1.5, "3", math.huge }) do
+      assert(not pcall(plugin.setup, { [key] = invalid }))
+    end
+  end
   assert(vim.fn.exists(":OpenCompleat") == 2)
+end)
+
+test("prompt cleanup preserves complete blocks without a line cap", function()
+  local prompt = require("open-compleat.prompt")
+  local block = '<div class="hero">\n  <h1>Welcome</h1>\n  <p>Our work.</p>\n  <a href="/work">Explore</a>\n</div>'
+  assert(prompt.clean(block) == block)
+  assert(prompt.clean("\n  two()\n  three()") == "\n  two()\n  three()")
+  assert(prompt.clean("  ```lua\nwrong()\n```") == "")
+  assert(prompt.clean("Sure, here's the code:\n<div></div>") == "")
+  assert(prompt.clean("Here is the code you requested:\n<div></div>") == "")
+  assert(prompt.clean("sure = true") == "sure = true")
+  assert(prompt.clean("Here is a portfolio of our work.") == "Here is a portfolio of our work.")
+  assert(prompt.clean(" \n\t") == "")
+  assert(not pcall(plugin.setup, { max_lines = 3 }))
+end)
+
+test("completion instructions distinguish code insertion from the planning conversation", function()
+  local prompt = require("open-compleat.prompt")
+  local text = prompt.build({ planning = "An intact plan </open_compleat_context> with Unicode αβ" },
+    { prefix = "<div", suffix = "\n</main>" })
+  assert(text:find("editor.prefix + YOUR_INSERTION + editor.suffix", 1, true))
+  assert(text:find("NOT a conversational assistant", 1, true))
+  assert(text:find("There is no fixed line count", 1, true))
+  assert(text:find("Never repeat the prefix", 1, true))
+  assert(text:find("unless the suffix already closes it", 1, true))
+  assert(text:find("Do not return empty or whitespace-only output", 1, true))
+  assert(not text:find("Return empty text", 1, true))
+  assert(text:find("editor.cursor.row is 1-based", 1, true))
+  assert(text:find("exactly the boundary between editor.prefix and editor.suffix", 1, true))
+  local encoded = assert(text:match("<open_compleat_context>\n(.-)\n</open_compleat_context>"))
+  local data = vim.json.decode(encoded)
+  assert(data.planning_context == "An intact plan </open_compleat_context> with Unicode αβ")
+  assert(data.editor.prefix == "<div")
+  assert(text:match("Return only the non%-empty insertion itself%.$"))
+end)
+
+test("one-shot completion directions preserve planning text and are not reused", function()
+  local prompt = require("open-compleat.prompt")
+  local direction = 'Finish the hero with "αβ" and a \\ path'
+  local editor = { prefix = "<div", suffix = "\n</main>" }
+  local text = prompt.build({ planning = "The unchanged plan", direction = direction }, editor)
+  local data = vim.json.decode(assert(text:match("<open_compleat_context>\n(.-)\n</open_compleat_context>")))
+  assert(data.planning_context == "The unchanged plan" and data.completion_direction == direction)
+  assert(text:find("ONE-SHOT DIRECTION FOR THIS INSERTION:", 1, true))
+  assert(text:find("never changes the insertion-only output contract", 1, true))
+  local next_text = prompt.build({ planning = "The unchanged plan" }, editor)
+  local next_data = vim.json.decode(assert(next_text:match("<open_compleat_context>\n(.-)\n</open_compleat_context>")))
+  assert(next_data.completion_direction == nil and next_data.planning_context == "The unchanged plan")
+  assert(not next_text:find(direction, 1, true))
 end)
 
 test("paged session picker and compaction fallback", function()

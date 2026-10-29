@@ -1,4 +1,4 @@
-"""Run isolated Neovim tests against a local, GET-only OpenCode fixture."""
+"""Run isolated context tests; also provides the mock server for completion tests."""
 
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +18,8 @@ AUTH = "Basic " + base64.b64encode(f"opencode:{PASSWORD}".encode()).decode()
 requests = []
 refreshes = 0
 context_reads = {}
+generations = []
+mutations = []
 
 
 def session(identifier):
@@ -35,6 +37,9 @@ class Handler(BaseHTTPRequestHandler):
         requests.append((url.path, query))
         if self.headers.get("Authorization") != AUTH:
             return self.respond(401, {"error": "Unauthorized"})
+        if url.path == "/openapi.json":
+            paths = getattr(self.server, "generation_paths", ["/api/experimental/generate"])
+            return self.respond(200, {"paths": {path: {"post": {}} for path in paths}})
         if url.path == "/api/model":
             assert "location[directory]" in query
             directory = query["location[directory]"][0]
@@ -117,6 +122,23 @@ class Handler(BaseHTTPRequestHandler):
                 ]})
         return self.respond(404, {"error": "Unknown fixture route"})
 
+    def do_POST(self):
+        mutations.append(self.path)
+        if self.headers.get("Authorization") != AUTH:
+            return self.respond(401, {"error": "Unauthorized"})
+        paths = getattr(self.server, "generation_paths", ["/api/experimental/generate"])
+        if self.path not in paths:
+            return self.respond(405, {"error": "Unexpected mutation"})
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        assert set(body) == {"prompt", "model"}
+        assert self.headers["Content-Type"] == "application/json"
+        generations.append(body)
+        delay = getattr(self.server, "generation_delay", 0)
+        status = getattr(self.server, "generation_status", 200)
+        response = getattr(self.server, "generation_response", {"data": {"text": "first()\n    second()\n    third()"}})
+        time.sleep(delay)
+        return self.respond(status, response)
+
     def respond(self, status, body):
         data = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(status)
@@ -145,6 +167,7 @@ if __name__ == "__main__":
                 timeout=35,
             )
             assert result.returncode == 0, f"Neovim tests exited {result.returncode}"
+            assert not mutations
             assert any(path == "/api/session" and "directory" in query for path, query in requests)
             assert any(path == "/api/session" and "directory" not in query for path, query in requests)
             print(f"PASS: {len(requests)} authenticated GET requests; no generation or mutation routes")

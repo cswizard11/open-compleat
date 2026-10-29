@@ -2,9 +2,12 @@ local M = {}
 local api = vim.api
 local client = require("open-compleat.client")
 local context = require("open-compleat.context")
+local completion = require("open-compleat.completion")
+local completion_input = require("open-compleat.input")
 local defaults = {
   service_file = (vim.env.XDG_STATE_HOME or (vim.env.HOME .. "/.local/state")) .. "/opencode/service.json",
   timeout_ms = 10000,
+  context_window = 16000,
 }
 local config = vim.deepcopy(defaults)
 local bindings = {}
@@ -43,7 +46,7 @@ end
 ---@param opts? table
 function M.setup(opts)
   opts = opts or {}
-  local allowed = { service_file = true, server = true, password = true, timeout_ms = true }
+  local allowed = { service_file = true, server = true, password = true, timeout_ms = true, context_window = true }
   for key in pairs(opts) do
     assert(allowed[key], "Unknown open-compleat option: " .. key)
   end
@@ -53,6 +56,12 @@ function M.setup(opts)
   assert(candidate.server == nil or type(candidate.server) == "string", "server must be a URL")
   assert(candidate.password == nil or type(candidate.password) == "string"
     or type(candidate.password) == "function", "password must be a string or function")
+  for _, key in ipairs({ "context_window" }) do
+    assert(type(candidate[key]) == "number" and candidate[key] > 0 and candidate[key] < math.huge
+      and candidate[key] == math.floor(candidate[key]), key .. " must be a positive integer")
+  end
+  completion_input.cancel()
+  completion.reset()
   config = candidate
   bindings = {}
 end
@@ -66,9 +75,24 @@ api.nvim_create_autocmd("TabClosed", {
   end,
 })
 
+api.nvim_create_autocmd({ "DirChanged", "TabLeave" }, {
+  group = "OpenCompleat",
+  callback = function(event)
+    completion.dismiss()
+    if event.event == "DirChanged" then
+      for tab, state in pairs(bindings) do
+        if not api.nvim_tabpage_is_valid(tab) or vim.fn.getcwd(0, api.nvim_tabpage_get_number(tab)) ~= state.directory then
+          bindings[tab] = nil
+        end
+      end
+    end
+  end,
+})
+
 --- Refresh the selected session. Older replies cannot replace newer selections.
 ---@param callback? fun(err: string?)
 function M.refresh(callback)
+  completion.dismiss()
   local state, tab = binding()
   if not state.session then
     if callback then callback("Select a planning session first: :OpenCompleat select") end
@@ -105,6 +129,7 @@ end
 ---@param id? string
 ---@param all? boolean
 function M.select(id, all)
+  completion.dismiss()
   local state, tab = binding()
   state.selection_revision = state.selection_revision + 1
   local revision = state.selection_revision
@@ -150,6 +175,7 @@ end
 
 --- Select the completion model without changing the planning session's model.
 function M.model()
+  completion.dismiss()
   local state, tab = binding()
   state.model_revision = state.model_revision + 1
   local revision = state.model_revision
@@ -173,6 +199,7 @@ function M.model()
       if not model or not current() then return end
       local function selected(variant)
         if not variant or not current() then return end
+        completion.dismiss()
         state.completion_model = { providerID = model.providerID, id = model.id, variant = variant.id }
         notify("Completion model selected: " .. model_label(state.completion_model))
       end
@@ -203,11 +230,68 @@ function M.get_context()
 end
 
 function M.clear()
+  completion.dismiss()
   local state = binding()
   state.revision = state.revision + 1
   state.selection_revision = state.selection_revision + 1
   state.session, state.cache, state.error, state.loading = nil, nil, nil, false
 end
+
+local function request_input(direction)
+  if direction ~= nil and type(direction) ~= "string" then
+    notify("Completion direction must be a string", vim.log.levels.WARN)
+    return nil
+  end
+  local state, tab = binding()
+  local planning, err = M.get_context()
+  if not planning then notify(err .. "; select or refresh the planning session first", vim.log.levels.WARN); return nil end
+  if not state.completion_model then
+    notify("Select a completion model first: :OpenCompleat model", vim.log.levels.WARN)
+    return nil
+  end
+  local connection, connection_err = client.connection(config)
+  if not connection then notify(connection_err, vim.log.levels.ERROR); return nil end
+  local cache, model, revision = state.cache, state.completion_model, state.revision
+  local selection_revision, model_revision = state.selection_revision, state.model_revision
+  return {
+    config = config,
+    connection = connection,
+    directory = state.directory,
+    planning = planning,
+    direction = direction and vim.trim(direction) ~= "" and vim.trim(direction) or nil,
+    model = vim.deepcopy(model),
+    context_window = config.context_window,
+    current = function()
+      return bindings[tab] == state and api.nvim_get_current_tabpage() == tab
+        and vim.fn.getcwd() == state.directory and not state.loading and not state.error
+        and state.cache == cache and state.completion_model == model and state.revision == revision
+        and state.selection_revision == selection_revision and state.model_revision == model_revision
+    end,
+  }
+end
+
+--- Request directly without a dialog. Direction applies to this request only.
+---@param direction? string
+---@return boolean
+function M.suggest(direction)
+  completion_input.cancel()
+  local input = request_input(direction)
+  return input and completion.suggest(input) or false
+end
+
+--- Ask for an optional direction, then return to the source Insert cursor.
+---@return boolean
+function M.prompt()
+  local input = request_input()
+  if not input then return false end
+  completion.dismiss()
+  return completion_input.open(input, completion.suggest)
+end
+
+function M.accept() return completion.accept() end
+function M.accept_line() return completion.accept(true) end
+function M.dismiss() completion_input.cancel(); completion.dismiss() end
+function M.statusline() return completion.statusline() end
 
 function M.status()
   local state = binding()
@@ -216,6 +300,7 @@ function M.status()
     session_id = state.session and state.session.id,
     title = state.session and state.session.title,
     completion_model = state.completion_model and vim.deepcopy(state.completion_model),
+    completion = completion.status(),
     loading = state.loading or false,
     error = state.error,
     bytes = state.cache and #state.cache.text,
@@ -235,6 +320,7 @@ function M.show_status()
     "Session: " .. (status.session_id or "Not selected"),
     "Title: " .. (status.title or "—"),
     "Completion model: " .. model_label(status.completion_model),
+    "Completion request: " .. status.completion.state,
     "Cache: " .. cache,
     "Messages: " .. (status.message_count or 0),
     "Text bytes: " .. (status.bytes or 0),
@@ -272,7 +358,7 @@ end
 function M.command(opts)
   local action, id = opts.fargs[1] or "status", opts.fargs[2]
   if #opts.fargs > 2 or (id and action ~= "select") then
-    notify("Usage: :OpenCompleat[!] select [session_id] | model | refresh | inspect | status | clear", vim.log.levels.ERROR)
+    notify("Usage: :OpenCompleat[!] select [session_id] | model | refresh | inspect | status | clear | prompt | suggest | accept | accept_line | dismiss", vim.log.levels.ERROR)
   elseif action == "select" then
     M.select(id, opts.bang)
   elseif action == "refresh" then
@@ -286,6 +372,16 @@ function M.command(opts)
   elseif action == "clear" then
     M.clear()
     notify("Planning session cleared for this tab")
+  elseif action == "suggest" then
+    M.suggest()
+  elseif action == "prompt" then
+    M.prompt()
+  elseif action == "accept" then
+    M.accept()
+  elseif action == "accept_line" then
+    M.accept_line()
+  elseif action == "dismiss" then
+    M.dismiss()
   else
     notify("Unknown OpenCompleat action: " .. action, vim.log.levels.ERROR)
   end

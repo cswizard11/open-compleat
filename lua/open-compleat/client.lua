@@ -1,4 +1,5 @@
 local M = {}
+local generation_paths = {}
 
 ---@class open_compleat.Connection
 ---@field url string
@@ -44,12 +45,7 @@ local function encode(value)
   end)
 end
 
----@param config table
----@param connection open_compleat.Connection
----@param path string
----@param query table
----@param callback fun(err: string?, response: table?)
-function M.get(config, connection, path, query, callback)
+local function request(config, connection, method, path, query, body, callback, raw)
   local parameters = {}
   for key, value in pairs(query) do
     parameters[#parameters + 1] = encode(key) .. "=" .. encode(value)
@@ -61,7 +57,7 @@ function M.get(config, connection, path, query, callback)
   end
   local args = {
     "curl", "--disable", "--silent", "--show-error", "--fail-with-body",
-    "--max-time", tostring(config.timeout_ms / 1000), "--request", "GET",
+    "--max-time", tostring(config.timeout_ms / 1000), "--request", method,
     "--config", "-", "--url", url,
   }
   if connection.local_service then
@@ -74,6 +70,10 @@ function M.get(config, connection, path, query, callback)
     stdin = 'header = "Authorization: Basic '
       .. vim.base64.encode("opencode:" .. connection.password) .. '"\n'
   end
+  if body then
+    local encoded = vim.json.encode(body):gsub("\\", "\\\\"):gsub('"', '\\"')
+    stdin = stdin .. 'header = "Content-Type: application/json"\ndata = "' .. encoded .. '"\n'
+  end
   local ok, job = pcall(vim.system, args, { text = true, stdin = stdin }, vim.schedule_wrap(function(result)
     if result.code ~= 0 then
       local message = result.code == 28 and "OpenCode request timed out"
@@ -82,7 +82,7 @@ function M.get(config, connection, path, query, callback)
       return
     end
     local decoded, response = pcall(vim.json.decode, result.stdout or "")
-    if not decoded or type(response) ~= "table" or type(response.data) ~= "table" then
+    if not decoded or type(response) ~= "table" or (not raw and type(response.data) ~= "table") then
       callback("OpenCode returned an unexpected response (expected JSON with data)")
       return
     end
@@ -93,6 +93,44 @@ function M.get(config, connection, path, query, callback)
     return nil
   end
   return job
+end
+
+---@param callback fun(err: string?, response: table?)
+function M.get(config, connection, path, query, callback)
+  return request(config, connection, "GET", path, query, nil, callback)
+end
+
+--- Discover the stateless route without making a generation request.
+---@param callback fun(err: string?, path: string?)
+function M.generation_path(config, connection, callback)
+  if generation_paths[connection.url] then
+    vim.schedule(function() callback(nil, generation_paths[connection.url]) end)
+    return nil
+  end
+  return request(config, connection, "GET", "/openapi.json", {}, nil, function(err, schema)
+    if err then callback(err); return end
+    for _, path in ipairs({ "/api/experimental/generate/text", "/api/experimental/generate" }) do
+      if type(schema.paths) == "table" and type(schema.paths[path]) == "table"
+          and type(schema.paths[path].post) == "table" then
+        generation_paths[connection.url] = path
+        callback(nil, path)
+        return
+      end
+    end
+    callback("This OpenCode server does not expose a supported stateless text-generation route")
+  end, true)
+end
+
+---@param callback fun(err: string?, text: string?)
+function M.generate(config, connection, path, prompt, model, callback)
+  return request(config, connection, "POST", path, {}, { prompt = prompt, model = model }, function(err, response)
+    if err then callback(err); return end
+    if type(response.data.text) ~= "string" then
+      callback("OpenCode returned a generation response without text")
+    else
+      callback(nil, response.data.text)
+    end
+  end)
 end
 
 function M.session(config, connection, id, callback)

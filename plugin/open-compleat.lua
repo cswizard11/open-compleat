@@ -6,10 +6,10 @@ vim.api.nvim_create_user_command("OpenCompleat", function(opts)
 end, {
   nargs = "*",
   bang = true,
-  desc = "Inspect planning context and select an independent completion model",
+  desc = "Select OpenCode planning context and request manual inline suggestions",
   complete = function(lead, line)
     if #vim.split(line, "%s+") > 2 then return {} end
     return vim.tbl_filter(function(action) return vim.startswith(action, lead) end,
-      { "select", "model", "refresh", "inspect", "status", "clear" })
+      { "select", "model", "refresh", "inspect", "status", "clear", "prompt", "suggest", "accept", "accept_line", "dismiss" })
   end,
 })
